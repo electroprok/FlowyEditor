@@ -1,0 +1,106 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;26.3.11579264" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Download SDL2, SDL2_ttf, SDL2_image, font
+        run: |
+          mkdir -p dl && cd dl
+          curl -fsSL -O https://github.com/libsdl-org/SDL/releases/download/release-2.30.9/SDL2-2.30.9.tar.gz
+          curl -fsSL -O https://github.com/libsdl-org/SDL_ttf/releases/download/release-2.22.0/SDL2_ttf-2.22.0.tar.gz
+          curl -fsSL -O https://github.com/libsdl-org/SDL_image/releases/download/release-2.8.2/SDL2_image-2.8.2.tar.gz
+          curl -fsSL -O https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.tar.bz2
+          tar xf SDL2-2.30.9.tar.gz
+          tar xf SDL2_ttf-2.22.0.tar.gz
+          tar xf SDL2_image-2.8.2.tar.gz
+          tar xf dejavu-fonts-ttf-2.37.tar.bz2
+
+      - name: Assemble Android project
+        run: |
+          set -e
+          P=$PWD/build-android
+          cp -r dl/SDL2-2.30.9/android-project $P
+          J=$P/app/jni
+          cp -r dl/SDL2-2.30.9 $J/SDL2
+          rm -rf $J/SDL2/android-project
+          cp -r dl/SDL2_ttf-2.22.0 $J/SDL2_ttf
+          cp -r dl/SDL2_image-2.8.2 $J/SDL2_image
+
+          # app sources
+          mkdir -p $J/src
+          cp flowyeditor/main.cpp $J/src/
+          cp -r flowyeditor/src $J/src/src
+
+          # header shim so that <SDL2/SDL.h>, <SDL2/SDL_ttf.h> work
+          mkdir -p $J/src/shim/SDL2
+          cp $J/SDL2/include/*.h $J/src/shim/SDL2/
+          cp $J/SDL2_ttf/SDL_ttf.h $J/src/shim/SDL2/
+          cp $J/SDL2_image/include/SDL_image.h $J/src/shim/SDL2/ 2>/dev/null || cp $J/SDL2_image/SDL_image.h $J/src/shim/SDL2/
+          cp $J/src/shim/SDL2/SDL_image.h $J/src/shim/
+
+          cat > $J/src/Android.mk <<'MK'
+          LOCAL_PATH := $(call my-dir)
+          include $(CLEAR_VARS)
+          LOCAL_MODULE := main
+          LOCAL_C_INCLUDES := $(LOCAL_PATH)/shim $(LOCAL_PATH)/shim/SDL2 $(LOCAL_PATH)/../SDL2/include
+          LOCAL_SRC_FILES := main.cpp
+          LOCAL_CPPFLAGS := -std=c++17 -frtti -fexceptions
+          LOCAL_SHARED_LIBRARIES := SDL2 SDL2_ttf SDL2_image
+          LOCAL_LDLIBS := -lGLESv1_CM -lGLESv2 -lOpenSLES -llog -landroid
+          include $(BUILD_SHARED_LIBRARY)
+          MK
+          sed -i 's/^          //' $J/src/Android.mk
+
+          cat > $J/Application.mk <<'MK'
+          APP_STL := c++_shared
+          APP_ABI := arm64-v8a armeabi-v7a
+          APP_PLATFORM := android-21
+          MK
+          sed -i 's/^          //' $J/Application.mk
+
+          # font
+          mkdir -p $P/app/src/main/assets
+          cp dl/dejavu-fonts-ttf-2.37/ttf/DejaVuSansMono.ttf $P/app/src/main/assets/font.ttf
+
+          # gradle / manifest / name
+          sed -i 's/applicationId "org.libsdl.app"/applicationId "com.flowy.editor"/' $P/app/build.gradle
+          sed -i '0,/android {/s//android {\n    ndkVersion "26.3.11579264"/' $P/app/build.gradle
+          sed -i 's|<string name="app_name">[^<]*</string>|<string name="app_name">FlowyEditor</string>|' $P/app/src/main/res/values/strings.xml
+          python3 - <<'PY'
+          import re,os
+          p=os.environ['GITHUB_WORKSPACE']+'/build-android/app/src/main/AndroidManifest.xml'
+          s=open(p).read()
+          s=s.replace('<application','<uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>\n    <application',1)
+          s=re.sub(r'(<activity\s+android:name="[^"]*")',r'\1\n            android:windowSoftInputMode="adjustResize"',s,1)
+          open(p,'w').write(s)
+          PY
+          sed -i 's/^          //' $P/app/src/main/AndroidManifest.xml 2>/dev/null || true
+          echo "build dir: $P"; echo "P=$P" >> $GITHUB_ENV
+
+      - name: Build
+        working-directory: ${{ env.P }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlowyEditor-apk
+          path: ${{ env.P }}/app/build/outputs/apk/debug/*.apk
